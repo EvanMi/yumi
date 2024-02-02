@@ -36,9 +36,9 @@ function App() {
     <div className="App">
      <div><button onClick={setupEventStream}>点我</button></div>
      <div>默认消息</div>
-     <ul>{defaultDatas.map(dd => <li>{dd}</li>)}</ul>
+     <ul>{defaultDatas.map((dd, i)  => <li key={i}>{dd}</li>)}</ul>
      <div>玉米消息</div>
-     <ul>{yumiDatas.map(dd => <li>{dd}</li>)}</ul>
+     <ul>{yumiDatas.map((dd, i) => <li key={i}>{dd}</li>)}</ul>
     </div>
   );
 }
