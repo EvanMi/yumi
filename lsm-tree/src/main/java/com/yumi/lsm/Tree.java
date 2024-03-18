@@ -104,15 +104,12 @@ public class Tree {
         ReentrantReadWriteLock.WriteLock writeLock = this.dataLock.writeLock();
         writeLock.lock();
         try {
+            boolean writeRes = this.walWriter.write(key, value);
+            if (!writeRes) {
+                this.refreshMemTableLocked();
+            }
             this.walWriter.write(key, value);
             this.memTable.put(key, value);
-            // 倘若读写跳表的大小未达到 level0 层 sstable 的大小阈值，则直接返回.
-            // 考虑到溢写成 sstable 后，需要有一些辅助的元数据，预估容量放大为 5/4 倍
-            if (this.memTable.size() * 5 / 4 <= this.config.getSstSize()) {
-                return;
-            }
-            this.refreshMemTableLocked();
-
         } finally {
             writeLock.unlock();
         }
@@ -182,13 +179,29 @@ public class Tree {
         int mid = start + ((end - start) >> 1);
         List<Node> levelNodes = this.nodes.get(level);
         Node midNode = levelNodes.get(mid);
-        if (AllUtils.compare(midNode.end(), key) < 0) {
-            return this.levelBinarySearch(level, key, mid + 1, end);
+
+        if (AllUtils.compare(midNode.end(), key) >= 0 && AllUtils.compare(midNode.start(), key) <= 0) {
+            return Optional.of(midNode);
         }
+
         if (AllUtils.compare(midNode.start(), key) > 0) {
-            return this.levelBinarySearch(level, key, start, mid - 1);
+            if (mid > 0 && AllUtils.compare(key, levelNodes.get(mid - 1).end()) >0 || mid == 0) {
+                return Optional.of(midNode);
+            } else {
+                return this.levelBinarySearch(level, key, start, mid - 1);
+            }
         }
-        return Optional.of(midNode);
+
+
+        if (AllUtils.compare(midNode.end(), key) < 0) {
+            if (mid < levelNodes.size() - 1 && AllUtils.compare(key, levelNodes.get(mid + 1).start()) < 0) {
+                return Optional.of(levelNodes.get(mid + 1));
+            } else {
+                return this.levelBinarySearch(level, key, mid + 1, end);
+            }
+        }
+
+        return Optional.empty();
     }
 
     private void refreshMemTableLocked() {
@@ -201,7 +214,7 @@ public class Tree {
             throw new RuntimeException(e);
         }
         this.memTableIndex++;
-        this.newMemTable();
+        this.newMemTable(this.config.getWalFileSize());
     }
 
     private void constructTree() {
@@ -220,7 +233,7 @@ public class Tree {
 
         //倘若 wal 目录不存在或者 wal 文件不存在，则构造一个新的 memtable
         if (wals.length == 0) {
-            this.newMemTable();
+            this.newMemTable(this.config.getWalFileSize());
         } else {
             this.restoreMemTable(wals);
         }
@@ -228,7 +241,7 @@ public class Tree {
 
     private void restoreMemTable(File[] wals) {
         //排序
-        Arrays.sort(wals, (f1, f2) -> {
+            Arrays.sort(wals, (f1, f2) -> {
             int f1Index = walFileToMemTableIndex(f1.getName());
             int f2Index = walFileToMemTableIndex(f2.getName());
             return f1Index - f2Index;
@@ -243,9 +256,23 @@ public class Tree {
                 walReader.restoreToMemTable(memTable);
                 if (i == wals.length - 1) {
                     // 倘若是最后一个 wal 文件，则 memtable 作为读写 memtable
-                    this.memTable = memTable;
                     this.memTableIndex = walFileToMemTableIndex(name);
-                    this.walWriter = new WalWriter(file);
+                    try {
+                        WalWriter tmpwalWriter = new WalWriter(file, this.config.getWalFileSize());
+                        this.memTable = memTable;
+                        this.walWriter = tmpwalWriter;
+                    } catch (IllegalStateException e) {
+                        MemTableCompactItem memTableCompactItem = new MemTableCompactItem(file, memTable);
+                        this.rOnlyMemTable.add(memTableCompactItem);
+                        try {
+                            this.memCompactQueue.put(memTableCompactItem);
+                        } catch (InterruptedException ie) {
+                            throw new RuntimeException(ie);
+                        }
+                        this.memTableIndex++;
+                        this.newMemTable(this.config.getWalFileSize());
+                    }
+
                 } else {
                     // memtable 作为只读 memtable，需要追加到只读 slice 以及 channel 中，继续推进完成溢写落盘流程
                     MemTableCompactItem memTableCompactItem = new MemTableCompactItem(file, memTable);
@@ -256,14 +283,16 @@ public class Tree {
                         throw new RuntimeException(e);
                     }
                 }
-            } finally {
+            } catch (Exception e) {
+                e.printStackTrace();
+            }finally {
                 walReader.close();
             }
         }
     }
 
-    private void newMemTable() {
-        this.walWriter = new WalWriter(this.walFile());
+    private void newMemTable(int size) {
+        this.walWriter = new WalWriter(this.walFile(), size);
         this.memTable = this.config.getMemTableConstructor().create();
     }
 
@@ -295,18 +324,29 @@ public class Tree {
 
         this.levelLocks[level].writeLock().lock();
         try {
-            // 对于 level0 而言，只需要 append 插入 node 即可
-            this.nodes.get(level).add(newNode);
-
-            if (level > 0) {
+            if (level == 0) {
+                // 对于 level0 而言，只需要 append 插入 node 即可
+                this.nodes.get(level).add(newNode);
+            } else {
                 // 对于 level1~levelk 层，需要根据 node 中 key 的大小，遵循顺序插入
-                Collections.sort(nodes.get(level), new Comparator<Node>() {
-                    @Override
-                    public int compare(Node n1, Node n2) {
-                        return AllUtils.compare(n1.start(), n2.end());
+                List<Node> levelNode = nodes.get(level);
+                if (levelNode.isEmpty()) {
+                    levelNode.add(newNode);
+                } else {
+                    int i = 0;
+                    for (; i < levelNode.size(); i++) {
+                        if (AllUtils.compare(newNode.end(), levelNode.get(i).start()) < 0) {
+                            levelNode.add(newNode);
+                        }
                     }
-                });
+                    if (i == levelNode.size()) {
+                        levelNode.add(newNode);
+                    }
+
+                }
             }
+        } catch (Exception e) {
+            e.printStackTrace();
         } finally {
             this.levelLocks[level].writeLock().unlock();
         }

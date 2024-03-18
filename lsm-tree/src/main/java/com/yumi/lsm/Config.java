@@ -13,12 +13,12 @@ public class Config {
     private String dir;
     // lsm tree 总共多少层
     private int maxLevel = 7;
-    // 每个 sst table 大小，默认 1M
-    private int sstSize = 1024 * 1024;
+    // 每个 sst table 大小，默认 2M
+    private int sstSize = 1024 * 1024 * 2;
     // 每层多少个 sst table，默认 10 个
     private int sstNumPerLevel = 10;
-    // sst table 中 block 大小 默认 16KB
-    private int sstDataBlockSize = 16 * 1024;
+    // sst table 中 block 大小 默认 32KB
+    private int sstDataBlockSize = 32 * 1024;
     // sst table 中 footer 部分大小. 固定为 32B
     private final int sstFooterSize = 16;
     // 过滤器. 默认使用布隆过滤器
@@ -68,6 +68,10 @@ public class Config {
 
     public int getSstSize() {
         return sstSize;
+    }
+
+    public int getWalFileSize() {
+        return getSstSize() * 4 / 5;
     }
 
     public void setSstSize(int sstSize) {

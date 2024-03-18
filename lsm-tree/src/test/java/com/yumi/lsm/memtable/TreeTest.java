@@ -25,7 +25,7 @@ public class TreeTest {
            for (int i = 0; i < 1000000; i++) {
                try {
                    TimeUnit.MILLISECONDS.sleep(10);
-                   tree.put(("testKey" + i).getBytes(), (i + ww).getBytes());
+                   tree.put(("testKey+" + i).getBytes(), (i + ww).getBytes());
                    if (i % 1000 == 0) {
                        System.out.println("testKey" + i);
                    }
@@ -38,7 +38,7 @@ public class TreeTest {
 
         for (int i = 0; i < 1000; i++) {
             try {
-                TimeUnit.SECONDS.sleep(1);
+                TimeUnit.MILLISECONDS.sleep(1000);
                 System.out.println("key ----------:      " + "testKey" + i);
                 Optional<byte[]> bytes = tree.get(("testKey" + i).getBytes());
                 if (bytes.isPresent()) {
@@ -51,6 +51,6 @@ public class TreeTest {
             }
         }
 
-        //tree.close();
+        tree.close();
     }
 }

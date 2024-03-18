@@ -12,6 +12,8 @@ import java.nio.channels.FileChannel;
 import java.util.ArrayList;
 import java.util.List;
 
+import static com.yumi.lsm.wal.WalConstants.MAGIC_END_NUM;
+
 public class WalReader {
     // 预写日志文件名，是包含了目录在内的绝对路径
     private String file;
@@ -51,9 +53,15 @@ public class WalReader {
     private List<MemTable.Kv> readAll(ByteBuffer buffer) {
         List<MemTable.Kv> res = new ArrayList<>();
         while (buffer.hasRemaining()) {
-            int keyLen = buffer.getInt();
+            int keyLenOrMagic = buffer.getInt();
+            if (keyLenOrMagic == MAGIC_END_NUM) {
+                break;
+            }
             int valLen = buffer.getInt();
-            byte[] key = new byte[keyLen];
+            if (keyLenOrMagic == 0 && valLen == 0) {
+                break;
+            }
+            byte[] key = new byte[keyLenOrMagic];
             byte [] val = new byte[valLen];
             buffer.get(key);
             buffer.get(val);

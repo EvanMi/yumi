@@ -48,6 +48,8 @@ public class SstWriter {
     // 前一个数据块的大小
     private int prevBlockSize;
 
+    private int blockRefreshCnt = 0;
+
 
     public SstWriter(String file, Config config) {
         File dest = new File(config.getDir() + File.separator + file);
@@ -106,7 +108,7 @@ public class SstWriter {
 
 
     public void append(byte[] key, byte[] value) {
-        if (this.dataBlock.getEntriesCnt() == 0) {
+        if (this.dataBlock.getEntriesCnt() == 0 && this.blockRefreshCnt > 0) {
             this.insertIndex(key);
         }
         this.dataBlock.append(key, value);
@@ -169,6 +171,7 @@ public class SstWriter {
         this.config.getFilter().reset();
         // 将 block 的数据添加到缓冲区
         this.prevBlockSize = this.dataBlock.flushTo(this.dataBuf);
+        this.blockRefreshCnt++;
     }
 
 
