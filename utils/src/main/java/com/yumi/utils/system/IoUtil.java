@@ -4,6 +4,7 @@ import java.io.CharArrayWriter;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -148,7 +149,7 @@ public class IoUtil {
      * @param encoding 编码格式
      * @throws IOException
      */
-    public void writeStringToFile(File file, String data, String encoding) throws IOException {
+    public static void writeStringToFile(File file, String data, String encoding) throws IOException {
         if (null == file) {
             throw new IllegalArgumentException("File is null");
         }
@@ -161,5 +162,56 @@ public class IoUtil {
         try (OutputStream out = new FileOutputStream(file)) {
             out.write(data.getBytes(encoding));
         }
+    }
+
+    public static String fileToString(String file) throws IOException {
+        return fileToString(new File(file));
+    }
+
+    public static String fileToString(File file) throws IOException{
+        if (!file.exists()) {
+            return null;
+        }
+
+        byte[] data = new byte[(int) file.length()];
+
+        boolean success;
+        try ( FileInputStream inputStream = new FileInputStream(file)) {
+            int len =  inputStream.read(data);
+            success = len == data.length;
+        }
+
+        if (success) {
+            return new String(data);
+        }
+        return null;
+    }
+
+    public static void stringToFileNotSafe(String data, String fileName) throws IOException {
+        File file = new File(fileName);
+        File parentFile = file.getParentFile();
+        if (parentFile != null) {
+            parentFile.mkdirs();
+        }
+        try (FileWriter fileWriter = new FileWriter(file)) {
+            fileWriter.write(data);
+        }
+    }
+
+    public static void stringToFile(String data, String fileName) throws IOException {
+        String tmpFile = fileName + ".tmp";
+        stringToFileNotSafe(data, tmpFile);
+
+        String bakFile = fileName + ".bak";
+        String prevContent = fileToString(fileName);
+        if (null != prevContent) {
+            stringToFileNotSafe(prevContent, bakFile);
+        }
+
+        File file = new File(fileName);
+        file.delete();
+
+        file = new File(tmpFile);
+        file.renameTo(new File(fileName));
     }
 }
