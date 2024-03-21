@@ -20,8 +20,8 @@ public class SstReader {
     private Config conf;
     // 对应的文件
     private RandomAccessFile src;
-    // 读取文件的 reader
-    private MappedByteBuffer reader;
+//    // 读取文件的 reader
+//    private MappedByteBuffer reader;
     // 过滤器块起始位置在 sstable 的 offset
     private int filterOffset;
     // 过滤器块的大小，单位 byte
@@ -30,6 +30,7 @@ public class SstReader {
     private int indexOffset;
     // 索引块的大小，单位 byte
     private int indexSize;
+    private FileChannel fileChannel;
 
     public SstReader (String file, Config conf) {
         File jFile = new File(conf.getDir() + File.separator + file);
@@ -40,13 +41,11 @@ public class SstReader {
         this.conf = conf;
         try {
             this.src = new RandomAccessFile(jFile, "r");
-            this.reader = this.src.getChannel().map(FileChannel.MapMode.READ_ONLY, 0, this.src.length());
+            this.fileChannel = this.src.getChannel();
         } catch (FileNotFoundException e) {
             IllegalStateException illegalStateException = new IllegalStateException("文件不存在");
             illegalStateException.addSuppressed(e);
             throw illegalStateException;
-        } catch (IOException e) {
-            throw new RuntimeException(e);
         }
     }
 
@@ -59,6 +58,7 @@ public class SstReader {
 
     public void close() {
         try {
+            this.fileChannel.close();
             this.src.close();
         } catch (IOException e) {
             throw new RuntimeException(e);
@@ -66,11 +66,10 @@ public class SstReader {
     }
 
     public void readFooter() {
-        ByteBuffer slice = this.reader.slice();
         try {
             long length = this.src.length();
-            slice.position((int)length - this.conf.getSstFooterSize());
-            slice.limit((int)length);
+            int bufferSize = this.conf.getSstFooterSize();
+            ByteBuffer slice = this.fileChannel.map(FileChannel.MapMode.READ_ONLY, (int)length - bufferSize, bufferSize);
             this.filterOffset = slice.getInt();
             this.filterSize = slice.getInt();
             this.indexOffset = slice.getInt();
@@ -164,10 +163,11 @@ public class SstReader {
 
 
     public ByteBuffer readBlock(int offset, int size) {
-        ByteBuffer slice = this.reader.slice();
-        slice.position(offset);
-        slice.limit( offset + size);
-        return slice;
+        try {
+            return this.fileChannel.map(FileChannel.MapMode.READ_ONLY, offset, size);
+        } catch (IOException ioe) {
+            throw new RuntimeException(ioe);
+        }
     }
 
 

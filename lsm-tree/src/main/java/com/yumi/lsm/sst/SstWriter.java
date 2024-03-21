@@ -4,13 +4,14 @@ import com.yumi.lsm.Config;
 import com.yumi.lsm.filter.bloom.BitsArray;
 import com.yumi.lsm.util.AllUtils;
 
-import java.io.BufferedOutputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
-import java.nio.file.Files;
+import java.nio.channels.FileChannel;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -22,15 +23,17 @@ public class SstWriter {
     // sstable 对应的磁盘文件
     private File dest;
     // 数据块缓冲区 key -> val
-    private ByteArrayOutputStream dataBuf;
+    //private List<ByteBuffer> dataBuf;
     // 过滤器块缓冲区 prev block offset -> filter bit map
-    private ByteArrayOutputStream filterBuf;
+    private List<ByteBuffer> filterBuf;
     // 索引块缓冲区 index key -> prev block offset, prev block size
-    private ByteArrayOutputStream indexBuf;
+    private List<ByteBuffer> indexBuf;
     // prev block offset -> filter bit map
     private Map<Integer, BitsArray> blockToFilter;
     // index key -> prev block offset, prev block size
     private Index[] index;
+
+    private FileChannel channel;
 
 
     // 数据块
@@ -47,8 +50,7 @@ public class SstWriter {
     private int prevBlockOffset;
     // 前一个数据块的大小
     private int prevBlockSize;
-
-    private int blockRefreshCnt = 0;
+    private ByteBuffer footBuffer;
 
 
     public SstWriter(String file, Config config) {
@@ -56,18 +58,24 @@ public class SstWriter {
 
         this.config = config;
         this.dest = dest;
-        this.dataBuf = new ByteArrayOutputStream();
-        this.filterBuf = new ByteArrayOutputStream();
-        this.indexBuf = new ByteArrayOutputStream();
+        try {
+            this.channel = new RandomAccessFile(dest, "rw").getChannel();
+        } catch (Exception e) {
+            throw new RuntimeException("创建文件失败");
+        }
+        //this.dataBuf = new ArrayList<>();
+        this.filterBuf = new ArrayList<>();
+        this.indexBuf = new ArrayList<>();
         this.blockToFilter = new HashMap<>();
-        this.dataBlock = new Block(config);
-        this.filterBlock = new Block(config);
-        this.indexBlock = new Block(config);
+        this.dataBlock = new Block(config, true);
+        this.filterBlock = new Block(config, false);
+        this.indexBlock = new Block(config,false);
         this.prevKey = new byte[0];
+        this.footBuffer = ByteBuffer.allocate(config.getSstFooterSize());
     }
 
     // 完成 sstable 的全部处理流程，包括将其中的数据溢写到磁盘，并返回信息供上层的 lsm 获取缓存
-    public FinishRes finish() {
+    public FinishRes finish() throws IOException{
         this.refreshBlock();// 完成最后一个块的处理
         this.insertIndex(this.prevKey);// 补齐最后一个 index
 
@@ -75,60 +83,66 @@ public class SstWriter {
         this.indexBlock.flushTo(this.indexBuf);
 
         // 处理 footer，记录布隆过滤器块起始、大小、索引块起始、大小
-        ByteBuffer byteBuffer = ByteBuffer.allocate(this.config.getSstFooterSize());
-        byteBuffer.putInt(this.dataBuf.size());
-        byteBuffer.putInt(this.filterBuf.size());
-        int size = this.dataBuf.size() + this.filterBuf.size();
-        byteBuffer.putInt(size);
-        byteBuffer.putInt(this.indexBuf.size());
-        BufferedOutputStream bfo = null;
+        ByteBuffer byteBuffer = this.footBuffer;
+        byteBuffer.clear();
+
+
+        FileChannel channel = this.channel;
+        int size = 0;
         try {
-            bfo = new BufferedOutputStream(Files.newOutputStream(this.dest.toPath()));
+            int dataPosition = (int) channel.position();
+            byteBuffer.putInt(dataPosition);
+            for (ByteBuffer buffer : filterBuf) {
+                channel.write(buffer);
+            }
+            int filterPosition = (int) this.channel.position();
 
-            bfo.write(this.dataBuf.toByteArray());
-            bfo.write(this.filterBuf.toByteArray());
-            bfo.write(this.indexBuf.toByteArray());
-            bfo.write(byteBuffer.array());
+            byteBuffer.putInt(filterPosition - dataPosition);
+            for (ByteBuffer buffer : indexBuf) {
+                channel.write(buffer);
+            }
+            int indexPosition = (int) this.channel.position();
+            size = indexPosition;
+            byteBuffer.putInt(filterPosition);
+            byteBuffer.putInt(indexPosition - filterPosition);
+            byteBuffer.flip();
 
-            bfo.flush();
+            channel.write(byteBuffer);
+            channel.force(true);
         } catch (Exception e) {
             e.printStackTrace();
-        } finally {
-            if (null != bfo) {
-                try {
-                    bfo.close();
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
-            }
         }
-
         return new FinishRes(size, this.blockToFilter, this.index);
     }
 
 
-    public void append(byte[] key, byte[] value) {
-        if (this.dataBlock.getEntriesCnt() == 0 && this.blockRefreshCnt > 0) {
+    public void append(byte[] key, byte[] value) throws IOException{
+        boolean res = this.dataBlock.append(key, value);
+        if (!res) {
+            this.refreshBlock();
             this.insertIndex(key);
+            res = this.dataBlock.append(key, value);
+            if (!res) {
+                throw new RuntimeException("bug");
+            }
         }
-        this.dataBlock.append(key, value);
         this.config.getFilter().add(key);
         this.prevKey = key;
-
-        if (this.dataBlock.size() >= this.config.getSstDataBlockSize()) {
-            this.refreshBlock();
-        }
     }
 
     public int size() {
-        return this.dataBuf.size();
+        try {
+            return (int) this.channel.position();
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
     }
 
     public void close() {
         try {
-            this.dataBuf.close();
-            this.indexBuf.close();
-            this.filterBuf.close();
+            this.channel.close();
+            this.indexBuf.clear();
+            this.filterBuf.clear();
         } catch (Exception e) {
             e.printStackTrace();
         }
@@ -154,12 +168,12 @@ public class SstWriter {
         this.index[this.index.length - 1] = localIndex;
     }
 
-    private void refreshBlock() {
+    private void refreshBlock() throws IOException {
         if (this.config.getFilter().keyLen() == 0) {
             return;
         }
 
-        this.prevBlockOffset = this.dataBuf.size();
+        this.prevBlockOffset = (int) this.channel.position();
         BitsArray filterBitmap = this.config.getFilter().hash();
         this.blockToFilter.put(this.prevBlockOffset, filterBitmap);
 
@@ -170,8 +184,7 @@ public class SstWriter {
         //重置布隆过滤器
         this.config.getFilter().reset();
         // 将 block 的数据添加到缓冲区
-        this.prevBlockSize = this.dataBlock.flushTo(this.dataBuf);
-        this.blockRefreshCnt++;
+        this.prevBlockSize = this.dataBlock.flushTo(this.channel);
     }
 
 

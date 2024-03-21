@@ -48,7 +48,9 @@ public class Node {
         this.size = size;
         this.blockToFilter = blockToFilter;
         this.index = index;
-        this.startKey = index[0].getKey();
+        Kv[] kvs = this.sstReader.readBlockData(this.sstReader.readBlock(index[0].getPrevBlockOffset(),
+                index[0].getPrevBlockSize()));
+        this.startKey = kvs[0].getKey();
         this.endKey = index[index.length - 1].getKey();
     }
 

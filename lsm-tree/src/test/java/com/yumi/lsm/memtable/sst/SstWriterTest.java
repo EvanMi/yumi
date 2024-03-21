@@ -7,7 +7,7 @@ import org.junit.jupiter.api.Test;
 public class SstWriterTest {
 
     @Test
-    public void testSmallFinish() {
+    public void testSmallFinish() throws Exception{
         Config config = Config.newConfig("/tmp/yumi");
         SstWriter sstWriter = new SstWriter("test", config);
 

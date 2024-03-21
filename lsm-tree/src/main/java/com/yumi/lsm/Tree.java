@@ -14,7 +14,6 @@ import java.io.File;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -40,9 +39,9 @@ public class Tree {
     private WalWriter walWriter;
     private List<List<Node>> nodes;
 
-    private final ArrayBlockingQueue<MemTableCompactItem> memCompactQueue = new ArrayBlockingQueue<>(10);
+    private final ArrayBlockingQueue<MemTableCompactItem> memCompactQueue = new ArrayBlockingQueue<>(500);
 
-    private final ArrayBlockingQueue<Integer> levelCompactQueue = new ArrayBlockingQueue<>(10);
+    private final ArrayBlockingQueue<Integer> levelCompactQueue = new ArrayBlockingQueue<>(50);
     private final AtomicBoolean stopC = new AtomicBoolean(false);
 
     // memtable index，需要与 wal 文件一一对应
@@ -72,32 +71,56 @@ public class Tree {
         this.compactPool.submit(() -> {
             while (!this.stopC.get()) {
                 try {
-                    MemTableCompactItem item = this.memCompactQueue.poll(10, TimeUnit.SECONDS);
-                    if (null != item) {
-                        this.compactMemTable(item);
+                    while (true) {
+                        MemTableCompactItem item = this.memCompactQueue.poll();
+                        if (null != item) {
+                            this.compactMemTable(item);
+                            continue;
+                        }
+                        break;
                     }
-                    Integer level = this.levelCompactQueue.poll(10, TimeUnit.SECONDS);
+                    Integer level = this.levelCompactQueue.poll();
                     if (null != level) {
                         this.compactLevel(level);
+                    }
+                    if (null == level) {
+                        TimeUnit.MILLISECONDS.sleep(500);
+                    }
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }
+
+
+        });
+
+        this.constructMemTable();
+
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            Tree.this.close();
+        }));
+    }
+
+    public void close() {
+        if (Tree.this.stopC.compareAndSet(false, true)) {
+            compactPool.shutdown();
+            boolean finished;
+            for (int i = 0; i < 3; i++) {
+                try {
+                    finished = this.compactPool.awaitTermination(30, TimeUnit.SECONDS);
+                    if (finished) {
+                        break;
                     }
                 } catch (InterruptedException e) {
                     e.printStackTrace();
                 }
             }
-        });
-
-        this.constructMemTable();
-    }
-
-    public void close() {
-        if (this.stopC.compareAndSet(false, true)) {
             for (List<Node> nodeLst : this.nodes) {
                 for (Node node : nodeLst) {
                     node.close();
                 }
             }
         }
-        this.compactPool.shutdown();
     }
 
     public void put(byte[] key, byte[] value) {
@@ -110,6 +133,8 @@ public class Tree {
             }
             this.walWriter.write(key, value);
             this.memTable.put(key, value);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
         } finally {
             writeLock.unlock();
         }
@@ -336,7 +361,8 @@ public class Tree {
                     int i = 0;
                     for (; i < levelNode.size(); i++) {
                         if (AllUtils.compare(newNode.end(), levelNode.get(i).start()) < 0) {
-                            levelNode.add(newNode);
+                            levelNode.add(i, newNode);
+                            break;
                         }
                     }
                     if (i == levelNode.size()) {
@@ -448,28 +474,38 @@ public class Tree {
         for (Node node : this.nodes.get(level)) {
             size += node.size();
         }
-        if (size <= this.config.getSstSize() * this.config.getSstNumPerLevel() * ((int) Math.pow(10, level))) {
+        if (size <= this.config.getLevelSstSize(level)) {
             return;
         }
-        this.compactPool.submit(() -> {
-            try {
-                this.levelCompactQueue.put(level);
-            } catch (InterruptedException e) {
-                throw new RuntimeException(e);
-            }
-        });
+        if (!this.compactPool.isShutdown()) {
+            this.compactPool.submit(() -> {
+                try {
+                    this.levelCompactQueue.put(level);
+                } catch (InterruptedException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+        } else {
+            System.out.println("线程池已经关闭,放弃本次提交");
+        }
     }
 
     private void compactLevel(int level) {
         List<Node> pickedNodes = this.pickCompactNodes(level);
+        if (pickedNodes.size() == 0) {
+            return;
+        }
         // 插入到 level + 1 层对应的目标 sstWriter
         int seq = this.levelToSeq[level + 1].get() + 1;
         SstWriter sstWriter = new SstWriter(this.sstFile(level + 1, seq), this.config);
         // 获取 level + 1 层每个 sst 文件的大小阈值
-        int sstLimit = this.config.getSstSize() * (int) Math.pow(10, level + 1);
+        int sstLimit = this.config.getLevelSstSize(level + 1);
         // 获取本次排序归并的节点涉及到的所有 kv 数据
         try {
             List<Kv> pickedKVs = this.pickedNodesToKVs(pickedNodes);
+            if (pickedKVs.size() == 0) {
+                System.err.println("pickedKVs-0");
+            }
             for (int i = 0; i < pickedKVs.size(); i++) {
                 // 倘若新生成的 level + 1 层 sst 文件大小已经超限
                 if (sstWriter.size() > sstLimit) {
@@ -488,6 +524,8 @@ public class Tree {
                     this.insertNode(level + 1, seq, finish.getSize(), finish.getBlockToFilter(), finish.getIndex());
                 }
             }
+        }  catch (Exception e) {
+            throw new RuntimeException(e);
         } finally {
             sstWriter.close();
         }
@@ -511,12 +549,10 @@ public class Tree {
                 writeLock.unlock();
             }
         }
-        this.compactPool.submit(() -> {
-            // 销毁老节点，包括关闭 sst reader，并且删除节点对应 sst 磁盘文件
-            for (Node pickedNode : pickedNodes) {
-                pickedNode.destroy();
-            }
-        });
+        // 销毁老节点，包括关闭 sst reader，并且删除节点对应 sst 磁盘文件
+        for (Node pickedNode : pickedNodes) {
+            pickedNode.destroy();
+        }
     }
 
     // 获取本轮 compact 流程涉及到的所有 kv 对. 这个过程中可能存在重复 k，保证只保留最新的 v
@@ -541,23 +577,34 @@ public class Tree {
     }
 
     private List<Node> pickCompactNodes(int level) {
-        // 每次合并范围为当前层前一半节点
         List<Node> levelNodes = this.nodes.get(level);
-        byte[] startKey = levelNodes.get(0).start();
-        byte[] endKey = levelNodes.get(0).end();
-
-        int mid = levelNodes.size() >> 1;
-        Node midNode = levelNodes.get(mid);
-        if (AllUtils.compare(midNode.start(), startKey) < 0) {
-            startKey = midNode.start();
+        byte[] startKey;
+        byte[] endKey;
+        if (levelNodes.isEmpty()) {
+            return Collections.emptyList();
         }
-        if (AllUtils.compare(midNode.end(), endKey) > 0) {
-            endKey = midNode.end();
+        if (level == 0) {
+            //level为0的时候全部合并
+            startKey = levelNodes.get(0).start();
+            endKey = levelNodes.get(0).end();
+            for (int i = 1; i < levelNodes.size(); i++) {
+                Node curNode = levelNodes.get(i);
+                if (AllUtils.compare(curNode.start(), startKey) < 0) {
+                    startKey = curNode.start();
+                }
+                if (AllUtils.compare(curNode.end(), endKey) > 0) {
+                    endKey = curNode.end();
+                }
+            }
+        } else {
+            //高层只合并两个
+            startKey = levelNodes.get(0).start();
+            int end = levelNodes.size() / (level + 1);
+            endKey = levelNodes.get(end).end();
         }
-
         List<Node> pickedNodes = new ArrayList<>();
         for (int i = level + 1; i >= level; i--) {
-            for (Node node : this.nodes.get(level)) {
+            for (Node node : this.nodes.get(i)) {
                 if (AllUtils.compare(endKey, node.start()) < 0 || AllUtils.compare(startKey, node.end()) > 0) {
                     continue;
                 }

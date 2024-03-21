@@ -70,6 +70,16 @@ public class Config {
         return sstSize;
     }
 
+    public int getLevelSstSize(int level) {
+        if (level == 0) {
+            return this.sstSize;
+        }
+        if (level == 1) {
+            return this.sstSize * 10;
+        }
+        return this.sstSize * 100 * level;
+    }
+
     public int getWalFileSize() {
         return getSstSize() * 4 / 5;
     }
