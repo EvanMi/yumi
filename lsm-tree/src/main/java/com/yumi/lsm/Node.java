@@ -58,6 +58,10 @@ public class Node {
         return this.sstReader.readData();
     }
 
+    public Kv[] getRange(int offset, int size) {
+        return this.sstReader.readData(offset, size);
+    }
+
     public Optional<byte[]> get(byte[] key) {
         Optional<Index> indexOptional = binarySearchIndex(key, 0, this.index.length - 1);
         if (!indexOptional.isPresent()) {
@@ -95,6 +99,10 @@ public class Node {
 
     public int[] index() {
         return new int[] {this.level, this.seq};
+    }
+
+    public Index[] indices() {
+        return this.index;
     }
 
     public void destroy() {

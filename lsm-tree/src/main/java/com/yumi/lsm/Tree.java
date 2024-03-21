@@ -14,9 +14,11 @@ import java.io.File;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.PriorityQueue;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -502,11 +504,27 @@ public class Tree {
         int sstLimit = this.config.getLevelSstSize(level + 1);
         // 获取本次排序归并的节点涉及到的所有 kv 数据
         try {
-            List<Kv> pickedKVs = this.pickedNodesToKVs(pickedNodes);
-            if (pickedKVs.size() == 0) {
-                System.err.println("pickedKVs-0");
+            int pickedSize = pickedNodes.size();
+            PriorityQueue<Kv> pq = new PriorityQueue<>((kv1, kv2) -> AllUtils.compare(kv1.getKey(), kv2.getKey()));
+            Index[][] pickedIndex = new Index[pickedSize][];
+            Map<Kv, Integer> nextCurMap = new HashMap<>();
+            Map<Kv, Integer> indexCurMap = new HashMap<>();
+            for (int i = 0; i < pickedSize; i++) {
+                pickedIndex[i] = pickedNodes.get(i).indices();
+                if (pickedIndex[i].length > 0) {
+                    int prevBlockOffset = pickedIndex[i][0].getPrevBlockOffset();
+                    int prevBlockSize = pickedIndex[i][0].getPrevBlockSize();
+                    Kv[] range = pickedNodes.get(i).getRange(prevBlockOffset, prevBlockSize);
+                    for (int k = 0; k < range.length; k++) {
+                        pq.add(range[k]);
+                        if (k == range.length - 1) {
+                            nextCurMap.put(range[k], 1);
+                            indexCurMap.put(range[k], i);
+                        }
+                    }
+                }
             }
-            for (int i = 0; i < pickedKVs.size(); i++) {
+            while (!pq.isEmpty()) {
                 // 倘若新生成的 level + 1 层 sst 文件大小已经超限
                 if (sstWriter.size() > sstLimit) {
                     SstWriter.FinishRes finish = sstWriter.finish();
@@ -516,14 +534,32 @@ public class Tree {
                     seq = this.levelToSeq[level + 1].get() + 1;
                     sstWriter = new SstWriter(this.sstFile(level + 1, seq), this.config);
                 }
-                Kv kv = pickedKVs.get(i);
+                Kv kv = pq.poll();
                 sstWriter.append(kv.getKey(), kv.getValue());
-                // 倘若这是最后一笔 kv 数据，需要负责把 sstWriter 溢写落盘并把对应 node 插入到 lsm tree 内存结构中
-                if (i == pickedKVs.size() - 1) {
-                    SstWriter.FinishRes finish = sstWriter.finish();
-                    this.insertNode(level + 1, seq, finish.getSize(), finish.getBlockToFilter(), finish.getIndex());
+                if (nextCurMap.containsKey(kv)) {
+                    Integer nextCur = nextCurMap.remove(kv);
+                    Integer indexCur = indexCurMap.remove(kv);
+                    if (null == nextCur || null == indexCur) {
+                        throw new IllegalStateException("bug");
+                    }
+                    Index[] curIndexArr = pickedIndex[indexCur];
+                    Node curNode = pickedNodes.get(indexCur);
+                    if (nextCur < curIndexArr.length) {
+                        Index curIndex = curIndexArr[nextCur];
+                        Kv[] range = curNode.getRange(curIndex.getPrevBlockOffset(), curIndex.getPrevBlockSize());
+                        for (int k = 0; k < range.length; k++) {
+                            pq.add(range[k]);
+                            if (k == range.length - 1) {
+                                nextCurMap.put(range[k], nextCur + 1);
+                                indexCurMap.put(range[k], indexCur);
+                            }
+                        }
+                    }
                 }
             }
+            SstWriter.FinishRes finish = sstWriter.finish();
+            this.insertNode(level + 1, seq, finish.getSize(), finish.getBlockToFilter(), finish.getIndex());
+
         }  catch (Exception e) {
             throw new RuntimeException(e);
         } finally {
