@@ -8,7 +8,6 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
-import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -130,6 +129,11 @@ public class SstReader {
             this.readFooter();
         }
         ByteBuffer byteBuffer = this.readBlock(0, filterOffset);
+        return readBlockData(byteBuffer);
+    }
+
+    public Kv[] readData(int offset, int size) {
+        ByteBuffer byteBuffer = this.readBlock(offset, size);
         return readBlockData(byteBuffer);
     }
 
