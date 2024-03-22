@@ -9,6 +9,7 @@ import com.yumi.lsm.sst.SstWriter;
 import com.yumi.lsm.util.AllUtils;
 import com.yumi.lsm.wal.WalReader;
 import com.yumi.lsm.wal.WalWriter;
+import org.jctools.queues.SpscArrayQueue;
 
 import java.io.File;
 import java.util.ArrayList;
@@ -19,7 +20,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.PriorityQueue;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -41,9 +41,9 @@ public class Tree {
     private WalWriter walWriter;
     private List<List<Node>> nodes;
 
-    private final ArrayBlockingQueue<MemTableCompactItem> memCompactQueue = new ArrayBlockingQueue<>(500);
+    private final SpscArrayQueue<MemTableCompactItem> memCompactQueue = new SpscArrayQueue<>(500);
 
-    private final ArrayBlockingQueue<Integer> levelCompactQueue = new ArrayBlockingQueue<>(50);
+    private final SpscArrayQueue<Integer> levelCompactQueue = new SpscArrayQueue<>(200);
     private final AtomicBoolean stopC = new AtomicBoolean(false);
 
     // memtable index，需要与 wal 文件一一对应
@@ -73,27 +73,37 @@ public class Tree {
         this.compactPool.submit(() -> {
             while (!this.stopC.get()) {
                 try {
-                    while (true) {
+                    int processCnt = 0;
+                    for (int i = 0; i < 60; i++) {
                         MemTableCompactItem item = this.memCompactQueue.poll();
                         if (null != item) {
                             this.compactMemTable(item);
-                            continue;
+                            processCnt++;
+                        } else {
+                            break;
                         }
-                        break;
                     }
-                    Integer level = this.levelCompactQueue.poll();
-                    if (null != level) {
-                        this.compactLevel(level);
+                    int lastLevel = -1;
+                    for (int i = 0; i < 30; i++) {
+                        Integer level = this.levelCompactQueue.poll();
+                        if (null != level) {
+                            if (lastLevel == level) {
+                                continue;
+                            }
+                            lastLevel = level;
+                            this.compactLevel(level);
+                            processCnt++;
+                        } else {
+                            break;
+                        }
                     }
-                    if (null == level) {
+                    if (processCnt == 0) {
                         TimeUnit.MILLISECONDS.sleep(500);
                     }
                 } catch (Exception e) {
                     e.printStackTrace();
                 }
             }
-
-
         });
 
         this.constructMemTable();
@@ -105,11 +115,14 @@ public class Tree {
 
     public void close() {
         if (Tree.this.stopC.compareAndSet(false, true)) {
-            compactPool.shutdown();
-            boolean finished;
+
+            ExecutorService executor = Tree.this.compactPool;
+            executor.shutdown();
+            boolean finished = false;
             for (int i = 0; i < 3; i++) {
                 try {
-                    finished = this.compactPool.awaitTermination(30, TimeUnit.SECONDS);
+                    System.out.println("waiting..." + System.currentTimeMillis());
+                    finished = executor.awaitTermination(30, TimeUnit.SECONDS);
                     if (finished) {
                         break;
                     }
@@ -117,11 +130,24 @@ public class Tree {
                     e.printStackTrace();
                 }
             }
+            if (!finished) {
+                System.out.println("force shutdown");
+                executor.shutdownNow();
+                try {
+                    if (!executor.awaitTermination(30, TimeUnit.SECONDS)) {
+                        System.out.println(String.format("%s didn't terminate!", executor));
+                    }
+                } catch (InterruptedException e) {
+                    throw new RuntimeException(e);
+                }
+            }
             for (List<Node> nodeLst : this.nodes) {
                 for (Node node : nodeLst) {
                     node.close();
                 }
             }
+            this.config.getBlockBufferPool().destroy();
+            System.out.println("bye~!");
         }
     }
 
@@ -212,7 +238,7 @@ public class Tree {
         }
 
         if (AllUtils.compare(midNode.start(), key) > 0) {
-            if (mid > 0 && AllUtils.compare(key, levelNodes.get(mid - 1).end()) >0 || mid == 0) {
+            if (mid > 0 && AllUtils.compare(key, levelNodes.get(mid - 1).end()) > 0 || mid == 0) {
                 return Optional.of(midNode);
             } else {
                 return this.levelBinarySearch(level, key, start, mid - 1);
@@ -235,10 +261,12 @@ public class Tree {
         MemTableCompactItem oldItem = new MemTableCompactItem(this.walFile(), this.memTable);
         this.rOnlyMemTable.add(oldItem);
         this.walWriter.close();
-        try {
-            this.memCompactQueue.put(oldItem);
-        } catch (InterruptedException e) {
-            throw new RuntimeException(e);
+        while (true) {
+            boolean offer = this.memCompactQueue.offer(oldItem);
+            if (offer) {
+                break;
+            }
+            Thread.yield();
         }
         this.memTableIndex++;
         this.newMemTable(this.config.getWalFileSize());
@@ -268,7 +296,7 @@ public class Tree {
 
     private void restoreMemTable(File[] wals) {
         //排序
-            Arrays.sort(wals, (f1, f2) -> {
+        Arrays.sort(wals, (f1, f2) -> {
             int f1Index = walFileToMemTableIndex(f1.getName());
             int f2Index = walFileToMemTableIndex(f2.getName());
             return f1Index - f2Index;
@@ -291,10 +319,12 @@ public class Tree {
                     } catch (IllegalStateException e) {
                         MemTableCompactItem memTableCompactItem = new MemTableCompactItem(file, memTable);
                         this.rOnlyMemTable.add(memTableCompactItem);
-                        try {
-                            this.memCompactQueue.put(memTableCompactItem);
-                        } catch (InterruptedException ie) {
-                            throw new RuntimeException(ie);
+                        while (true) {
+                            boolean offer = this.memCompactQueue.offer(memTableCompactItem);
+                            if (offer) {
+                                break;
+                            }
+                            Thread.yield();
                         }
                         this.memTableIndex++;
                         this.newMemTable(this.config.getWalFileSize());
@@ -304,15 +334,17 @@ public class Tree {
                     // memtable 作为只读 memtable，需要追加到只读 slice 以及 channel 中，继续推进完成溢写落盘流程
                     MemTableCompactItem memTableCompactItem = new MemTableCompactItem(file, memTable);
                     this.rOnlyMemTable.add(memTableCompactItem);
-                    try {
-                        this.memCompactQueue.put(memTableCompactItem);
-                    } catch (InterruptedException e) {
-                        throw new RuntimeException(e);
+                    while (true) {
+                        boolean offer = this.memCompactQueue.offer(memTableCompactItem);
+                        if (offer) {
+                            break;
+                        }
+                        Thread.yield();
                     }
                 }
             } catch (Exception e) {
                 e.printStackTrace();
-            }finally {
+            } finally {
                 walReader.close();
             }
         }
@@ -481,10 +513,9 @@ public class Tree {
         }
         if (!this.compactPool.isShutdown()) {
             this.compactPool.submit(() -> {
-                try {
-                    this.levelCompactQueue.put(level);
-                } catch (InterruptedException e) {
-                    throw new RuntimeException(e);
+                boolean res = this.levelCompactQueue.offer(level);
+                if (!res) {
+                    System.out.println("压缩文件忙");
                 }
             });
         } else {
@@ -560,7 +591,7 @@ public class Tree {
             SstWriter.FinishRes finish = sstWriter.finish();
             this.insertNode(level + 1, seq, finish.getSize(), finish.getBlockToFilter(), finish.getIndex());
 
-        }  catch (Exception e) {
+        } catch (Exception e) {
             throw new RuntimeException(e);
         } finally {
             sstWriter.close();

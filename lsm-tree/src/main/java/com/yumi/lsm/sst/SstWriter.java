@@ -51,6 +51,8 @@ public class SstWriter {
     // 前一个数据块的大小
     private int prevBlockSize;
     private ByteBuffer footBuffer;
+    private ByteBuffer indexValueBuffer;
+    private ByteBuffer filterKeyBuffer;
 
 
     public SstWriter(String file, Config config) {
@@ -71,7 +73,9 @@ public class SstWriter {
         this.filterBlock = new Block(config, false);
         this.indexBlock = new Block(config,false);
         this.prevKey = new byte[0];
-        this.footBuffer = ByteBuffer.allocate(config.getSstFooterSize());
+        this.footBuffer = ByteBuffer.allocateDirect(config.getSstFooterSize());
+        this.indexValueBuffer = ByteBuffer.allocateDirect(Integer.BYTES * 2);
+        this.filterKeyBuffer = ByteBuffer.allocateDirect(Integer.BYTES);
     }
 
     // 完成 sstable 的全部处理流程，包括将其中的数据溢写到磁盘，并返回信息供上层的 lsm 获取缓存
@@ -94,12 +98,14 @@ public class SstWriter {
             byteBuffer.putInt(dataPosition);
             for (ByteBuffer buffer : filterBuf) {
                 channel.write(buffer);
+                this.config.getBlockBufferPool().returnBuffer(buffer);
             }
             int filterPosition = (int) this.channel.position();
 
             byteBuffer.putInt(filterPosition - dataPosition);
             for (ByteBuffer buffer : indexBuf) {
                 channel.write(buffer);
+                this.config.getBlockBufferPool().returnBuffer(buffer);
             }
             int indexPosition = (int) this.channel.position();
             size = indexPosition;
@@ -150,10 +156,14 @@ public class SstWriter {
 
     private void insertIndex(byte[] key) {
         byte[] indexKey = AllUtils.getSeparatorBetween(this.prevKey, key);
-        ByteBuffer buffer = ByteBuffer.allocate(Integer.BYTES * 2);
+        ByteBuffer buffer = this.indexValueBuffer;
+        buffer.clear();
         buffer.putInt(this.prevBlockOffset);
         buffer.putInt(this.prevBlockSize);
-        this.indexBlock.append(indexKey, buffer.array());
+        buffer.flip();
+        byte[] indexVal = new byte[Integer.BYTES * 2];
+        buffer.get(indexVal);
+        this.indexBlock.append(indexKey, indexVal);
         if (null == this.index) {
             this.index = new Index[1];
         } else {
@@ -177,9 +187,13 @@ public class SstWriter {
         BitsArray filterBitmap = this.config.getFilter().hash();
         this.blockToFilter.put(this.prevBlockOffset, filterBitmap);
 
-        ByteBuffer buffer = ByteBuffer.allocate(Integer.BYTES);
+        ByteBuffer buffer = this.filterKeyBuffer;
+        buffer.clear();
         buffer.putInt(this.prevBlockOffset);
-        this.filterBlock.append(buffer.array(), filterBitmap.bytes());
+        buffer.flip();
+        byte[] filterKey = new byte[Integer.BYTES];
+        buffer.get(filterKey);
+        this.filterBlock.append(filterKey, filterBitmap.bytes());
 
         //重置布隆过滤器
         this.config.getFilter().reset();

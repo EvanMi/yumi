@@ -4,6 +4,7 @@ import com.yumi.lsm.filter.Filter;
 import com.yumi.lsm.filter.LsmBloomFilter;
 import com.yumi.lsm.memtable.MemTableConstructor;
 import com.yumi.lsm.memtable.SkipListMemTable;
+import com.yumi.lsm.sst.BlockBufferPool;
 
 import java.io.File;
 import java.util.function.Consumer;
@@ -25,6 +26,8 @@ public class Config {
     private Filter filter = new LsmBloomFilter();
     // memtable 构造器，默认为跳表
     private MemTableConstructor memTableConstructor = SkipListMemTable::new;
+    private BlockBufferPool blockBufferPool;
+    private int blockBufferPoolSize = 3000;
 
     private Config() {
 
@@ -36,6 +39,8 @@ public class Config {
         for (ConfigOption opt : opts) {
             opt.accept(config);
         }
+        config.setBlockBufferPool(new BlockBufferPool(config.getBlockBufferPoolSize(), config));
+        config.getBlockBufferPool().init();
         config.check();
         return config;
     }
@@ -142,6 +147,22 @@ public class Config {
             throw new IllegalStateException("非法的maxLevel");
         }
         this.maxLevel = maxLevel;
+    }
+
+    public BlockBufferPool getBlockBufferPool() {
+        return blockBufferPool;
+    }
+
+    public void setBlockBufferPool(BlockBufferPool blockBufferPool) {
+        this.blockBufferPool = blockBufferPool;
+    }
+
+    public int getBlockBufferPoolSize() {
+        return blockBufferPoolSize;
+    }
+
+    public void setBlockBufferPoolSize(int blockBufferPoolSize) {
+        this.blockBufferPoolSize = blockBufferPoolSize;
     }
 
     @FunctionalInterface

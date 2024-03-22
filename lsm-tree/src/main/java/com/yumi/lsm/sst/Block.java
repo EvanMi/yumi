@@ -30,7 +30,7 @@ public class Block {
         this.config = config;
         this.isData = isData;
         this.record = new ArrayList<>();
-        this.record.add(ByteBuffer.allocate(this.config.getSstDataBlockSize()));
+        this.record.add(this.config.getBlockBufferPool().borrowBuffer());
     }
 
     public int size() {
@@ -47,7 +47,7 @@ public class Block {
         }
         if (curBytes > remainingBytes) {
             //其他类型的模块自动扩容
-            lastBuffer = ByteBuffer.allocate(this.config.getSstDataBlockSize());
+            lastBuffer = this.config.getBlockBufferPool().borrowBuffer();
             this.record.add(lastBuffer);
         }
 
@@ -87,6 +87,7 @@ public class Block {
             for (ByteBuffer byteBuffer : this.record) {
                 byteBuffer.flip();
                 channel.write(byteBuffer);
+                this.config.getBlockBufferPool().returnBuffer(byteBuffer);
             }
         } catch (IOException e) {
             throw new RuntimeException(e);
@@ -100,7 +101,7 @@ public class Block {
         this.entriesCnt = 0;
         this.record.clear();
         this.prevKey = new byte[0];
-        this.record.add(ByteBuffer.allocate(this.config.getSstDataBlockSize()));
+        this.record.add(this.config.getBlockBufferPool().borrowBuffer());
     }
 
 
