@@ -22,10 +22,10 @@ public class TreeTest {
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         Tree tree = new Tree(Config.newConfig("/tmp/tree"));
         new Thread(() -> {
-           for (int i = 0; i < 1000000; i++) {
+           for (int i = 0; i < 100000; i++) {
                try {
-                   TimeUnit.MILLISECONDS.sleep(10);
-                   tree.put(("testKey+" + i).getBytes(), (i + ww).getBytes());
+                   TimeUnit.MILLISECONDS.sleep(50);
+                   tree.put(("testKey" + i).getBytes(), (i + ww).getBytes());
                    if (i % 1000 == 0) {
                        System.out.println("testKey" + i);
                    }
@@ -34,13 +34,14 @@ public class TreeTest {
                }
            }
            tree.close();
-        }).start();
+        });
 
-        for (int i = 0; i < 1000; i++) {
+        for (int i = 10000; i <= 12000; i++) {
             try {
-                TimeUnit.MILLISECONDS.sleep(1000);
-                System.out.println("key ----------:      " + "testKey" + i);
-                Optional<byte[]> bytes = tree.get(("testKey" + i).getBytes());
+                TimeUnit.MILLISECONDS.sleep(10);
+                String key = "testKey!" + i;
+                System.out.println("key ----------:      " + key);
+                Optional<byte[]> bytes = tree.get(key.getBytes());
                 if (bytes.isPresent()) {
                     System.out.println(new String(bytes.get()));
                 } else {
